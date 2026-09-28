@@ -1,0 +1,230 @@
+# =====================================================================
+#  بيئة Windows مجانية عبر GitHub Actions + اتصال RDP عن طريق ngrok
+#  ---------------------------------------------------------------
+#  الطريقة: workflow_dispatch (تشغيل يدوي من تبويب Actions)
+#  المدة القصوى: 6 ساعات للجلسة الواحدة (حد GitHub)
+#  المتطلب الوحيد: حساب ngrok مجاني (authtoken)
+# =====================================================================
+name: "RDP - Windows + ngrok"
+
+on:
+  workflow_dispatch:
+    inputs:
+      session_minutes:
+        description: "مدة الجلسة بالدقائق (الحد الأقصى 360)"
+        required: true
+        default: "360"
+        type: choice
+        options: ["60", "120", "240", "360"]
+      rdp_user:
+        description: "اسم مستخدم RDP"
+        required: true
+        default: "ghadmin"
+      rdp_port:
+        description: "منفذ RDP الداخلي"
+        required: true
+        default: "3389"
+      show_password_in_summary:
+        description: "إظهار كلمة المرور في ملخص الـ Run (⚠️ المستودع العام = مكشوفة للجميع)"
+        required: true
+        default: "true"
+        type: choice
+        options: ["true", "false"]
+      restart_machine:
+        description: "إعادة تشغيل الجهاز لإنشاء جلسة Console (⚠️ يقطع خطوات الـ workflow التالية)"
+        required: false
+        default: false
+        type: boolean
+
+# يمنع تشغيل أكثر من جلسة في نفس الوقت (يوفر الدقائق ويمنع التعارض)
+concurrency:
+  group: rdp-session
+  cancel-in-progress: false
+
+jobs:
+  windows-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 360
+    steps:
+      # ---------------------------------------------------------------
+      # 1) جلب ملفات المشروع (سكربتات PowerShell)
+      # ---------------------------------------------------------------
+      - name: "Checkout repository"
+        uses: actions/checkout@v4
+
+      # ---------------------------------------------------------------
+      # 2) توليد كلمة مرور قوية عشوائية للجلسة
+      #    (لا تُكتب كلمة مرور ثابتة داخل الملف!)
+      # ---------------------------------------------------------------
+      - name: "Generate session credentials"
+        id: creds
+        shell: pwsh
+        run: |
+          $user = "${{ inputs.rdp_user }}"
+          $bytes = New-Object byte[] 24
+          [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+          $alphabet = 'abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789!@#$%&*'
+          $pass = -join ($bytes | ForEach-Object { $alphabet[$_ % $alphabet.Length] })
+          # نضعها في مخرجات الخطوة التالية فقط (وليس في اللوج بشكل مكشوف)
+          "rdp_user=$user" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "rdp_pass=$pass" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Host "تم توليد بيانات الدخول للجلسة."
+
+      # ---------------------------------------------------------------
+      # 3) تفعيل Remote Desktop + جدار الحماية + NLA
+      # ---------------------------------------------------------------
+      - name: "Enable Remote Desktop"
+        shell: pwsh
+        run: |
+          ./scripts/enable-rdp.ps1 -Username "${{ steps.creds.outputs.rdp_user }}" `
+                                   -Password "${{ steps.creds.outputs.rdp_pass }}" `
+                                   -Port ${{ inputs.rdp_port }}
+
+      # ---------------------------------------------------------------
+      # 4) تحميل ngrok وتشغيل النفق
+      #    NGROK_AUTHTOKEN يُقرأ من Secrets (انظر ملف README)
+      # ---------------------------------------------------------------
+      - name: "Install ngrok"
+        shell: pwsh
+        run: |
+          $url = "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip"
+          Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP\ngrok.zip"
+          Expand-Archive -Path "$env:RUNNER_TEMP\ngrok.zip" -DestinationPath "$env:RUNNER_TEMP\ngrok" -Force
+          & "$env:RUNNER_TEMP\ngrok\ngrok.exe" authtoken $env:NGROK_AUTHTOKEN
+          Write-Host "ngrok جاهز."
+        env:
+          NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
+
+      - name: "Start ngrok tunnel (TCP -> RDP)"
+        shell: pwsh
+        run: |
+          $ngrok = "$env:RUNNER_TEMP\ngrok\ngrok.exe"
+          Start-Process -FilePath $ngrok `
+                        -ArgumentList "tcp","${{ inputs.rdp_port }}","--log","$env:RUNNER_TEMP\ngrok.log","--log-format","json" `
+                        -WindowStyle Hidden
+          Start-Sleep -Seconds 8
+          Write-Host "النفق يعمل."
+
+      # ---------------------------------------------------------------
+      # 5) قراءة العنوان العام وعرضه في ملخص الـ Run
+      # ---------------------------------------------------------------
+      - name: "Show RDP connection info"
+        shell: pwsh
+        env:
+          RDP_PASS: ${{ steps.creds.outputs.rdp_pass }}
+          SHOW_PASS: ${{ inputs.show_password_in_summary }}
+        run: |
+          $tries = 0
+          $tunnels = $null
+          while ($tries -lt 12 -and -not $tunnels) {
+            try {
+              $r = Invoke-RestMethod -Uri "http://127.0.0.1:4040/api/tunnels" -TimeoutSec 5
+              $tunnels = $r.tunnels | Where-Object { $_.proto -eq 'tcp' } | Select-Object -First 1
+            } catch { Start-Sleep -Seconds 3 }
+            $tries++
+          }
+          if (-not $tunnels) {
+            Write-Host "----- سجل ngrok للتشخيص -----"
+            Get-Content "$env:RUNNER_TEMP\ngrok.log" -Tail 30 -ErrorAction SilentlyContinue
+            throw "تعذّر الحصول على عنوان النفق من ngrok."
+          }
+
+          $parts = $tunnels.public_url -split ':'
+          $host_ = $parts[0]
+          $port  = $parts[1]
+          $user  = "${{ steps.creds.outputs.rdp_user }}"
+
+          # إخفاء كلمة المرور في السجلات إن طُلب ذلك
+          if ($env:SHOW_PASS -eq 'false') {
+            Write-Host "::add-mask::$env:RDP_PASS"
+            $passDisplay = "_(مخفية — فعّل show_password_in_summary لرؤيتها)_"
+          } else {
+            Write-Host "⚠️  تحذير: كلمة المرور ظاهرة في ملخص عام."
+            $passDisplay = "``$env:RDP_PASS``"
+          }
+
+          # حفظ البيانات محلياً داخل الجهاز (مفيدة إن كانت مخفية)
+          @"
+          Host=$host_
+          Port=$port
+          User=$user
+          Pass=$env:RDP_PASS
+          "@ | Set-Content "$env:RUNNER_TEMP\rdp-connection.txt" -Encoding utf8
+
+          $summary = @"
+          ## 🖥️ جلسة RDP جاهزة
+
+          | الحقل | القيمة |
+          |---|---|
+          | **العنوان (Host)** | ``$host_`` |
+          | **المنفذ (Port)** | ``$port`` |
+          | **اسم المستخدم** | ``$user`` |
+          | **كلمة المرور** | $passDisplay |
+
+          ### 🔌 للاتصال من Windows
+          1. اضغط ``Win + R`` ثم اكتب: ``mstsc``
+          2. في حقل الكمبيوتر اكتب: ``$host_`:$port``
+          3. اسم المستخدم: ``$user`` — ثم كلمة المرور أعلاه.
+
+          ### 📱 للاتصال من الهاتف
+          ثبّت **Microsoft Remote Desktop** (RD Client) وأضف PC جديد بنفس البيانات.
+
+          ### ⚠️ قبل أن تتصل
+          - انتظر حتى تظهر حالة الـ Run كـ "in progress" مستقرة (~3 دقائق).
+          - إن رأيت شاشة سوداء: انتظر 20 ثانية ثم حرّك الماوس واضغط ``Ctrl+Alt+End``.
+          - إن استمرت الشاشة السوداء: استخدم workflow **"Windows Desktop in Browser"**.
+
+          > ⏱️ تنتهي الجلسة تلقائياً بعد ${{ inputs.session_minutes }} دقيقة،
+          > أو عند إيقاف الـ Run يدوياً من تبويب Actions.
+          "@
+          $summary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+          Write-Host "=========================================="
+          Write-Host " Host : $host_"
+          Write-Host " Port : $port"
+          Write-Host " User : $user"
+          Write-Host "=========================================="
+
+      # ---------------------------------------------------------------
+      # 5b) خطوة اختيارية: إعادة التشغيل لإنشاء جلسة Console تفاعلية
+      #     (تُستخدم فقط إذا واجهت شاشة سوداء)
+      # ---------------------------------------------------------------
+      - name: "Optional restart for console session"
+        if: ${{ inputs.restart_machine == true }}
+        continue-on-error: true
+        shell: pwsh
+        run: ./scripts/restart-to-console.ps1 -DelaySeconds 20
+
+      # ---------------------------------------------------------------
+      # 6) إبقاء الجهاز حيّاً حتى نهاية المدة المحددة
+      # ---------------------------------------------------------------
+      - name: "Keep session alive"
+        shell: pwsh
+        run: |
+          $minutes = [int]"${{ inputs.session_minutes }}"
+          $deadline = (Get-Date).AddMinutes($minutes)
+          Write-Host "الجلسة ستنتهي في: $deadline"
+          while ((Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 30
+            # فحص أن النفق ما زال حيّاً
+            try {
+              Invoke-RestMethod -Uri "http://127.0.0.1:4040/api/tunnels" -TimeoutSec 5 | Out-Null
+            } catch {
+              Write-Host "تحذير: نفق ngrok غير مستجيب، تتم إعادة تشغيله..."
+              $ngrok = "$env:RUNNER_TEMP\ngrok\ngrok.exe"
+              Start-Process -FilePath $ngrok `
+                            -ArgumentList "tcp","${{ inputs.rdp_port }}","--log","$env:RUNNER_TEMP\ngrok.log","--log-format","json" `
+                            -WindowStyle Hidden
+              Start-Sleep -Seconds 10
+            }
+          }
+          Write-Host "انتهت مدة الجلسة."
+
+      # ---------------------------------------------------------------
+      # 7) تنظيف: إيقاف RDP عند انتهاء الجلسة (أفضل ممارسة أمنية)
+      # ---------------------------------------------------------------
+      - name: "Cleanup - disable RDP"
+        if: always()
+        shell: pwsh
+        run: |
+          ./scripts/disable-rdp.ps1 -Port ${{ inputs.rdp_port }}

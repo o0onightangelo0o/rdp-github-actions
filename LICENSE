@@ -1,0 +1,36 @@
+MIT License
+
+Copyright (c) 2026
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+---
+
+NOTICE / تنبيه مهم
+
+This project is provided for legitimate software development, testing and
+CI/CD purposes only. Users are solely responsible for complying with the
+GitHub Terms of Service and the GitHub Actions usage limits, including the
+prohibition on cryptocurrency mining, persistent hosting, and any activity
+unrelated to software development.
+
+يُقدَّم هذا المشروع لأغراض تطوير واختبار البرمجيات و CI/CD المشروعة فقط.
+المستخدم وحده مسؤول عن الالتزام بشروط استخدام GitHub وحدود GitHub Actions،
+بما فيها حظر تعدين العملات الرقمية والاستضافة الدائمة وأي نشاط لا علاقة له
+بتطوير البرمجيات.

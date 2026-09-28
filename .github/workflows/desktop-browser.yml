@@ -1,0 +1,129 @@
+# =====================================================================
+#  الخيار الأبسط: سطح مكتب Windows داخل المتصفح (بدون أي حساب أو Tokens)
+#  ---------------------------------------------------------------
+#  الفكرة: TightVNC (خادم VNC بواجهة ويب) + Cloudflare Quick Tunnel
+#  النتيجة: رابط https تفتحه في أي متصفح وترى سطح المكتب وتتحكم به.
+#  لماذا؟   Cloudflare Quick Tunnel يدعم HTTP(S) بشكل ممتاز، بينما RDP
+#           بروتوكول TCP خام ويحتاج وسيطاً. VNC-Web يعمل مباشرة.
+# =====================================================================
+name: "Windows Desktop in Browser (بدون حساب)"
+
+on:
+  workflow_dispatch:
+    inputs:
+      session_minutes:
+        description: "مدة الجلسة بالدقائق"
+        required: true
+        default: "240"
+        type: choice
+        options: ["60", "120", "240", "360"]
+      vnc_password:
+        description: "كلمة مرور VNC (6-8 أحرف) - اتركها فارغة للتوليد التلقائي"
+        required: false
+        default: ""
+
+concurrency:
+  group: vnc-session
+  cancel-in-progress: false
+
+jobs:
+  windows-vnc:
+    runs-on: windows-latest
+    timeout-minutes: 360
+    steps:
+      - name: "Generate VNC password"
+        id: pass
+        shell: pwsh
+        run: |
+          $p = "${{ inputs.vnc_password }}"
+          if ([string]::IsNullOrWhiteSpace($p)) {
+            $chars = 'abcdefghijkmnpqrstuvwxyz23456789'
+            $p = -join ((1..8) | ForEach-Object { $chars[(Get-Random -Maximum $chars.Length)] })
+          }
+          # VNC Classic يقبل 8 أحرف كحد أقصى
+          if ($p.Length -gt 8) { $p = $p.Substring(0,8) }
+          "vnc_pass=$p" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Host "كلمة المرور جاهزة (ستظهر في الملخص)."
+
+      - name: "Install TightVNC"
+        shell: pwsh
+        run: |
+          $installer = "https://www.tightvnc.com/download/2.8.84/tightvnc-2.8.84-gpl-setup-64bit.msi"
+          Invoke-WebRequest -Uri $installer -OutFile "$env:RUNNER_TEMP\tightvnc.msi"
+          $pass = "${{ steps.pass.outputs.vnc_pass }}"
+          Start-Process msiexec.exe -ArgumentList "/i","$env:RUNNER_TEMP\tightvnc.msi","/quiet","/norestart", `
+            "ADDLOCAL=Server,Viewer", `
+            "SET_USECONTROLAUTHENTICATION=1", `
+            "VALUE_OF_USECONTROLAUTHENTICATION=$pass", `
+            "SET_CONTROLAUTHALWAYS=1", `
+            "VALUE_OF_CONTROLAUTHALWAYS=$pass", `
+            "SET_USECONTROLAUTHENTICATIONVIEWONLY=0", `
+            "VALUE_USECONTROLAUTHENTICATIONVIEWONLY=" `
+            -Wait
+          Write-Host "تم تثبيت TightVNC."
+
+      - name: "Allow VNC through firewall"
+        shell: pwsh
+        run: |
+          New-NetFirewallRule -DisplayName "VNC 5900" -Direction Inbound -Protocol TCP `
+                              -LocalPort 5900 -Action Allow -Profile Any | Out-Null
+          Start-Service -Name tvnserver -ErrorAction SilentlyContinue
+          Write-Host "خادم VNC يعمل على المنفذ 5900."
+
+      - name: "Install cloudflared"
+        shell: pwsh
+        run: |
+          Invoke-WebRequest `
+            -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" `
+            -OutFile "$env:RUNNER_TEMP\cloudflared.exe"
+
+      - name: "Start tunnel to VNC web interface"
+        shell: pwsh
+        run: |
+          Start-Process -FilePath "$env:RUNNER_TEMP\cloudflared.exe" `
+                        -ArgumentList "tunnel","--no-autoupdate","http","localhost:5800" `
+                        -RedirectStandardError "$env:RUNNER_TEMP\cf.log" `
+                        -WindowStyle Hidden
+          Start-Sleep -Seconds 12
+          Write-Host "النفق يعمل."
+
+      - name: "Show access link"
+        shell: pwsh
+        run: |
+          $url = $null
+          for ($i = 0; $i -lt 15 -and -not $url; $i++) {
+            $m = Select-String -Path "$env:RUNNER_TEMP\cf.log" `
+                 -Pattern 'https://[a-z0-9\-]+\.trycloudflare\.com' -ErrorAction SilentlyContinue |
+                 Select-Object -First 1
+            if ($m) { $url = $m.Matches[0].Value } else { Start-Sleep -Seconds 5 }
+          }
+          if (-not $url) {
+            Get-Content "$env:RUNNER_TEMP\cf.log" -ErrorAction SilentlyContinue | Select-Object -Last 40
+            throw "تعذّر استخراج رابط النفق."
+          }
+
+          @"
+          ## 🖥️ سطح مكتب Windows جاهز في متصفحك
+
+          | الحقل | القيمة |
+          |---|---|
+          | **الرابط** | $url |
+          | **كلمة المرور** | ``${{ steps.pass.outputs.vnc_pass }}`` |
+
+          ### طريقة الاستخدام
+          1. افتح الرابط أعلاه في أي متصفح (Chrome / Edge).
+          2. أدخل كلمة المرور.
+          3. ستظهر شاشة Windows كاملة ويمكنك التحكم بها بالماوس والكيبورد.
+
+          > ⏱️ الجلسة تنتهي تلقائياً بعد ${{ inputs.session_minutes }} دقيقة.
+          > 🔒 لا تشارك الرابط مع أحد — من يملكه يستطيع الدخول.
+          "@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          Write-Host "URL: $url"
+
+      - name: "Keep session alive"
+        shell: pwsh
+        run: |
+          $minutes  = [int]"${{ inputs.session_minutes }}"
+          $deadline = (Get-Date).AddMinutes($minutes)
+          while ((Get-Date) -lt $deadline) { Start-Sleep -Seconds 30 }
+          Write-Host "انتهت الجلسة."

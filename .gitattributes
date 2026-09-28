@@ -1,0 +1,14 @@
+# ثبّت نهايات الأسطر داخل المستودع على LF، وحوّلها لـ CRLF عند السحب على Windows
+* text=auto eol=lf
+
+# ملفات Windows تُسحب دائماً بـ CRLF
+*.ps1   text eol=crlf
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+*.rdp   text eol=crlf
+
+# ملفات ثنائية - لا تُعدّل
+*.docx  binary
+*.zip   binary
+*.png   binary
+*.jpg   binary

@@ -1,0 +1,35 @@
+# ملفات نظام
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# PowerShell
+*.log
+ExportedCommands.xml
+
+# أسرار وملفات محلية - لا ترفعها أبداً
+*.rdp
+secrets.env
+.env
+credentials.json
+ngrok.yml
+*.pfx
+*.p12
+
+# أدوات
+ngrok.exe
+cloudflared.exe
+*.zip
+*.msi
+
+# بيئات Python
+__pycache__/
+*.pyc
+.venv-doc/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+rdp-github-actions.zip

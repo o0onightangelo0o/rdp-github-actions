@@ -1,0 +1,169 @@
+# =====================================================================
+#  خيار بدون ngrok وبدون حساب: RustDesk (خادم ذاتي الاستضافة)
+#  ---------------------------------------------------------------
+#  الفكرة: نشغّل خادم RustDesk (hbbs/hbbr) وعميل RustDesk على نفس الجهاز،
+#          فتصل من جهازك بـ ID + Key بدل العنوان والمنفذ.
+#
+#  ⚠️ تجريبي: يعتمد على قدرة الـ runner على استقبال/إرسال حزم UDP
+#     (منافذ 21116-21119). إن لم يعمل، استخدم rdp-ngrok.yml (الأضمن)
+#     أو desktop-browser.yml (الأسهل).
+# =====================================================================
+name: "RustDesk - بدون حساب (تجريبي)"
+
+on:
+  workflow_dispatch:
+    inputs:
+      session_minutes:
+        description: "مدة الجلسة بالدقائق"
+        required: true
+        default: "240"
+        type: choice
+        options: ["60", "120", "240", "360"]
+
+concurrency:
+  group: rustdesk-session
+  cancel-in-progress: false
+
+env:
+  # ثبّت الإصدارات هنا حتى لا ينكسر الـ workflow مستقبلاً
+  RUSTDESK_VERSION: "1.4.9"
+  RUSTDESK_SERVER_VERSION: "1.1.16"
+
+jobs:
+  rustdesk:
+    runs-on: windows-latest
+    timeout-minutes: 360
+    steps:
+      - name: "Open RustDesk ports in firewall"
+        shell: pwsh
+        run: |
+          foreach ($p in 21115..21119) {
+            New-NetFirewallRule -DisplayName "RustDesk TCP $p" -Direction Inbound `
+                                -Protocol TCP -LocalPort $p -Action Allow -Profile Any | Out-Null
+          }
+          foreach ($p in 21116,21118) {
+            New-NetFirewallRule -DisplayName "RustDesk UDP $p" -Direction Inbound `
+                                -Protocol UDP -LocalPort $p -Action Allow -Profile Any | Out-Null
+          }
+          Write-Host "تم فتح منافذ RustDesk."
+
+      - name: "Download RustDesk server (hbbs/hbbr)"
+        shell: pwsh
+        run: |
+          $url = "https://github.com/rustdesk/rustdesk-server/releases/download/$env:RUSTDESK_SERVER_VERSION/rustdesk-server-windows-x86_64-unsigned.zip"
+          Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP\rdserver.zip"
+          Expand-Archive "$env:RUNNER_TEMP\rdserver.zip" "$env:RUNNER_TEMP\rdserver" -Force
+          Get-ChildItem -Recurse "$env:RUNNER_TEMP\rdserver" -Filter *.exe |
+            ForEach-Object { Write-Host "  وجد: $($_.FullName)" }
+
+      - name: "Start hbbs (ID/rendezvous server)"
+        shell: pwsh
+        run: |
+          $hbbs = Get-ChildItem -Recurse "$env:RUNNER_TEMP\rdserver" -Filter "hbbs*" |
+                  Where-Object { $_.Extension -eq '.exe' } | Select-Object -First 1
+          if (-not $hbbs) { throw "لم يتم العثور على hbbs.exe" }
+          Start-Process -FilePath $hbbs.FullName -WorkingDirectory $hbbs.DirectoryName `
+                        -ArgumentList "-k","_" -WindowStyle Hidden
+          Start-Sleep -Seconds 10
+          # المفاتيح تُولَّد في مجلد العمل
+          $idFile = Join-Path $hbbs.DirectoryName "id_ed25519.pub"
+          if (Test-Path $idFile) {
+            $key = (Get-Content $idFile -Raw).Trim()
+            "rustdesk_key=$key" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+            Write-Host "Key تم توليده."
+          } else {
+            Write-Host "تحذير: لم يُولَّد المفتاح بعد."
+          }
+        id: hbbs
+
+      - name: "Start hbbr (relay server)"
+        shell: pwsh
+        run: |
+          $hbbr = Get-ChildItem -Recurse "$env:RUNNER_TEMP\rdserver" -Filter "hbbr*" |
+                  Where-Object { $_.Extension -eq '.exe' } | Select-Object -First 1
+          if (-not $hbbr) { throw "لم يتم العثور على hbbr.exe" }
+          Start-Process -FilePath $hbbr.FullName -WorkingDirectory $hbbr.DirectoryName `
+                        -ArgumentList "-k","_" -WindowStyle Hidden
+          Start-Sleep -Seconds 5
+          Write-Host "خادم الترحيل يعمل."
+
+      - name: "Install RustDesk client & configure self-hosted server"
+        shell: pwsh
+        run: |
+          $url = "https://github.com/rustdesk/rustdesk/releases/download/$env:RUSTDESK_VERSION/rustdesk-$env:RUSTDESK_VERSION-x86_64.exe"
+          Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP\rustdesk-setup.exe"
+          Start-Process "$env:RUNNER_TEMP\rustdesk-setup.exe" `
+                        -ArgumentList "--silent-install" -Wait
+          Write-Host "تم تثبيت عميل RustDesk."
+
+          # عنوان IP العام للـ runner = عنوان الخادم
+          $publicIp = (Invoke-RestMethod "https://api.ipify.org" -TimeoutSec 15)
+          "public_ip=$publicIp" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Host "IP العام: $publicIp"
+        id: client
+
+      - name: "Write RustDesk config and read the ID"
+        shell: pwsh
+        run: |
+          $cfgDir = "$env:APPDATA\RustDesk\config"
+          if (-not (Test-Path $cfgDir)) { New-Item -ItemType Directory -Path $cfgDir -Force | Out-Null }
+          $cfg = @{
+            rendezvous_server = "${{ steps.client.outputs.public_ip }}"
+            key               = "${{ steps.hbbs.outputs.rustdesk_key }}"
+          } | ConvertTo-Json
+          Set-Content -Path "$cfgDir\RustDesk2.toml" -Value $cfg -Encoding utf8
+
+          # تشغيل RustDesk لتسجيل الـ ID
+          $exe = Get-ChildItem "$env:ProgramFiles\RustDesk","$env:LOCALAPPDATA\Programs\RustDesk" `
+                 -Filter "rustdesk.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $exe) { throw "لم يتم العثور على rustdesk.exe بعد التثبيت." }
+          Start-Process $exe.FullName -ArgumentList "--server" -WindowStyle Hidden
+          Start-Sleep -Seconds 20
+
+          $idFile = "$cfgDir\RustDesk.toml"
+          $rdId = $null
+          if (Test-Path $idFile) {
+            $m = Select-String -Path $idFile -Pattern '^\s*id\s*=\s*"(\d+)"' | Select-Object -First 1
+            if ($m) { $rdId = $m.Matches[0].Groups[1].Value }
+          }
+          if (-not $rdId) {
+            Write-Host "----- محتوى ملف الإعدادات -----"
+            Get-Content $idFile -ErrorAction SilentlyContinue
+            throw "تعذّر قراءة معرّف RustDesk."
+          }
+          "rustdesk_id=$rdId" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+        id: id
+
+      - name: "Show RustDesk connection info"
+        shell: pwsh
+        run: |
+          @"
+          ## 🖥️ اتصال RustDesk جاهز
+
+          | الحقل | القيمة |
+          |---|---|
+          | **ID** | ``${{ steps.id.outputs.rustdesk_id }}`` |
+          | **Key** | ``${{ steps.hbbs.outputs.rustdesk_key }}`` |
+          | **Server** | ``${{ steps.client.outputs.public_ip }}`` |
+
+          ### طريقة الاستخدام من جهازك
+          1. حمّل RustDesk من <https://rustdesk.com/download> وثبّته
+          2. افتح **Settings → Network → Unlock** ثم **ID/Relay Server**
+          3. املأ: ID Server = ``${{ steps.client.outputs.public_ip }}`` ،
+             Key = ``${{ steps.hbbs.outputs.rustdesk_key }}``
+          4. في الشاشة الرئيسية أدخل ID = ``${{ steps.id.outputs.rustdesk_id }}``
+          5. اضغط **Connect** — عند طلب كلمة المرور استخدم كلمة مرور جلسة Windows
+             من workflow الـ RDP، أو عيّن كلمة مرور RustDesk من الإعدادات.
+
+          > ⚠️ **خيار تجريبي:** إن فشل الاتصال فغالباً الـ runner يحجب UDP.
+          > الحل المضمون: استخدم workflow **"RDP - Windows + ngrok"**.
+          "@ | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          Write-Host "ID : ${{ steps.id.outputs.rustdesk_id }}"
+
+      - name: "Keep session alive"
+        shell: pwsh
+        run: |
+          $minutes  = [int]"${{ inputs.session_minutes }}"
+          $deadline = (Get-Date).AddMinutes($minutes)
+          while ((Get-Date) -lt $deadline) { Start-Sleep -Seconds 30 }
+          Write-Host "انتهت الجلسة."

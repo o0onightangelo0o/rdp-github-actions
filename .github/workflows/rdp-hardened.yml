@@ -1,0 +1,137 @@
+# =====================================================================
+#  نسخة مؤمّنة بالكامل (Hardened) — للاستخدام المتكرر
+#  ---------------------------------------------------------------
+#  الفرق عن النسخة البسيطة:
+#    • اسم المستخدم وكلمة المرور و ngrok token كلها في Secrets
+#    • كلمة المرور لا تظهر أبداً في السجلات (Logs)
+#    • عنوان الاتصال يُرسل إليك عبر Telegram/Slack بدلاً من الـ Summary
+#    • إيقاف تلقائي عند الخمول (Idle timeout) لتوفير الدقائق
+# =====================================================================
+name: "RDP - Hardened (Secrets)"
+
+on:
+  workflow_dispatch:
+    inputs:
+      session_minutes:
+        description: "مدة الجلسة بالدقائق (الحد الأقصى 360)"
+        required: true
+        default: "120"
+      idle_timeout_minutes:
+        description: "إيقاف الجلسة إذا لم يكن هناك نشاط RDP خلال هذه المدة (0 = تعطيل)"
+        required: true
+        default: "30"
+
+concurrency:
+  group: rdp-hardened
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 360
+    steps:
+      - name: "Checkout repository"
+        uses: actions/checkout@v4
+
+      - name: "Enable Remote Desktop (credentials from Secrets)"
+        shell: pwsh
+        env:
+          RDP_USER: ${{ secrets.RDP_USERNAME }}
+          RDP_PASS: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          if (-not $env:RDP_USER -or -not $env:RDP_PASS) {
+            throw "يجب إضافة Secretين: RDP_USERNAME و RDP_PASSWORD"
+          }
+          # ::add-mask:: يمنع ظهور القيمة في أي سجل لاحق
+          Write-Host "::add-mask::$env:RDP_PASS"
+          ./scripts/enable-rdp.ps1 -Username $env:RDP_USER -Password $env:RDP_PASS -Port 3389
+
+      - name: "Install & start ngrok"
+        shell: pwsh
+        env:
+          NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
+        run: |
+          if (-not $env:NGROK_AUTHTOKEN) { throw "أضف Secret باسم NGROK_AUTHTOKEN" }
+          Invoke-WebRequest -Uri "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip" `
+                            -OutFile "$env:RUNNER_TEMP\ngrok.zip"
+          Expand-Archive "$env:RUNNER_TEMP\ngrok.zip" "$env:RUNNER_TEMP\ngrok" -Force
+          & "$env:RUNNER_TEMP\ngrok\ngrok.exe" authtoken $env:NGROK_AUTHTOKEN
+          Start-Process -FilePath "$env:RUNNER_TEMP\ngrok\ngrok.exe" `
+                        -ArgumentList "tcp","3389","--log","$env:RUNNER_TEMP\ngrok.log","--log-format","json" `
+                        -WindowStyle Hidden
+          Start-Sleep -Seconds 8
+
+      - name: "Notify connection details (Telegram)"
+        shell: pwsh
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT:  ${{ secrets.TELEGRAM_CHAT_ID }}
+          RDP_USER: ${{ secrets.RDP_USERNAME }}
+          RDP_PASS: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          $t = $null
+          for ($i = 0; $i -lt 10 -and -not $t; $i++) {
+            try {
+              $r = Invoke-RestMethod "http://127.0.0.1:4040/api/tunnels" -TimeoutSec 5
+              $t = $r.tunnels | Where-Object { $_.proto -eq 'tcp' } | Select-Object -First 1
+            } catch { Start-Sleep -Seconds 3 }
+          }
+          if (-not $t) { throw "لم يتم الحصول على عنوان النفق." }
+
+          $parts = $t.public_url -split ':'
+          $info  = "🖥️ RDP جاهز`nHost: $($parts[0])`nPort: $($parts[1])`nUser: $env:RDP_USER`nPass: $env:RDP_PASS"
+
+          if ($env:TG_TOKEN -and $env:TG_CHAT) {
+            $body = @{ chat_id = $env:TG_CHAT; text = $info }
+            Invoke-RestMethod -Uri "https://api.telegram.org/bot$env:TG_TOKEN/sendMessage" `
+                              -Method Post -Body $body | Out-Null
+            Write-Host "تم إرسال التفاصيل إلى تيليجرام."
+            # لا نضع كلمة المرور في الملخص العام إطلاقاً
+            "## 🔐 جلسة RDP جاهزة`n`nتم إرسال بيانات الاتصال إلى تيليجرام. (لا تُعرض هنا لأسباب أمنية)" |
+              Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          } else {
+            # لا توجد بيانات تيليجرام → تُعرض في الملخص مع تحذير واضح
+            Write-Host "::add-mask::$env:RDP_PASS"
+            Write-Host "⚠️  لم يتم إعداد تيليجرام — ستظهر كلمة المرور في الملخص العام."
+            @"
+          ## 🔐 بيانات الاتصال (⚠️ معروضة علناً — انتقل لإعداد تيليجرام)
+
+          | الحقل | القيمة |
+          |---|---|
+          | **Host** | ``$($parts[0])`` |
+          | **Port** | ``$($parts[1])`` |
+          | **User** | ``$env:RDP_USER`` |
+          | **Pass** | ``$env:RDP_PASS`` |
+          "@ | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          }
+
+      - name: "Hold session with idle detection"
+        shell: pwsh
+        run: |
+          $total = [int]"${{ inputs.session_minutes }}"
+          $idle  = [int]"${{ inputs.idle_timeout_minutes }}"
+          $start = Get-Date
+          $lastActive = Get-Date
+
+          while (((Get-Date) - $start).TotalMinutes -lt $total) {
+            Start-Sleep -Seconds 60
+            # هل توجد جلسة RDP نشطة؟
+            $sessions = query session 2>$null | Select-String 'Active|Disc'
+            if ($sessions) { $lastActive = Get-Date }
+
+            if ($idle -gt 0 -and ((Get-Date) - $lastActive).TotalMinutes -ge $idle) {
+              Write-Host "لا يوجد نشاط منذ $idle دقيقة → إنهاء الجلسة."
+              break
+            }
+            Write-Host "الجلسة نشطة... ($([int]((Get-Date)-$start).TotalMinutes)/$total دقيقة)"
+          }
+
+      - name: "Cleanup"
+        if: always()
+        shell: pwsh
+        env:
+          RDP_USER: ${{ secrets.RDP_USERNAME }}
+        run: ./scripts/disable-rdp.ps1 -Port 3389 -Username $env:RDP_USER
