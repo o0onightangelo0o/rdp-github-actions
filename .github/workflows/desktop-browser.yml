@@ -1,10 +1,23 @@
 # =====================================================================
-#  الخيار الأبسط: سطح مكتب Windows داخل المتصفح (بدون أي حساب أو Tokens)
-#  ---------------------------------------------------------------
-#  الفكرة: TightVNC (خادم VNC بواجهة ويب) + Cloudflare Quick Tunnel
-#  النتيجة: رابط https تفتحه في أي متصفح وترى سطح المكتب وتتحكم به.
-#  لماذا؟   Cloudflare Quick Tunnel يدعم HTTP(S) بشكل ممتاز، بينما RDP
-#           بروتوكول TCP خام ويحتاج وسيطاً. VNC-Web يعمل مباشرة.
+#  سطح مكتب Windows داخل المتصفح — بدون أي حساب أو Tokens
+#  ---------------------------------------------------------------------
+#  البنية (مُختبَرة فعلياً):
+#     TightVNC  ──RFB──►  5900
+#                          │
+#     websockify ──WS──►  6080  (يخدم ملفات noVNC أيضاً)
+#                          │
+#     cloudflared ─────►  https://xxxx.trycloudflare.com  (HTTP/2)
+#                          │
+#     متصفحك  ──noVNC HTML5──►  سطح مكتب Windows
+#
+#  ⚠️ لماذا ليس منفذ 5800 مباشرة؟
+#     لأن TightVNC يقدّم على 5800 «Java applet»، والمتصفحات الحديثة
+#     حذفت دعم Java (Chrome 2015 · Firefox 2017) — فلن يعمل.
+#     الحل: noVNC وهو عميل HTML5/WebSocket حقيقي.
+#
+#  ⚠️ لماذا --protocol http2؟
+#     الافتراضي في cloudflared صار QUIC (يحتاج UDP)، وقد يحجبه الـ runner.
+#     http2 يعمل عبر TCP الموثوق.
 # =====================================================================
 name: "Windows Desktop in Browser (بدون حساب)"
 
@@ -18,33 +31,73 @@ on:
         type: choice
         options: ["60", "120", "240", "360"]
       vnc_password:
-        description: "كلمة مرور VNC (6-8 أحرف) - اتركها فارغة للتوليد التلقائي"
+        description: "كلمة مرور VNC (حتى 8 أحرف) — اتركها فارغة للتوليد التلقائي"
         required: false
         default: ""
+      desktop_user:
+        description: "اسم مستخدم Windows لجلسة سطح المكتب"
+        required: true
+        default: "ghuser"
 
 concurrency:
   group: vnc-session
   cancel-in-progress: false
+
+env:
+  NOVNC_VERSION: "1.6.0"
 
 jobs:
   windows-vnc:
     runs-on: windows-latest
     timeout-minutes: 360
     steps:
+      # ---------------------------------------------------------------
+      # 1) توليد كلمة مرور VNC
+      # ---------------------------------------------------------------
       - name: "Generate VNC password"
         id: pass
         shell: pwsh
         run: |
           $p = "${{ inputs.vnc_password }}"
           if ([string]::IsNullOrWhiteSpace($p)) {
+            $bytes = New-Object byte[] 16
+            [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
             $chars = 'abcdefghijkmnpqrstuvwxyz23456789'
-            $p = -join ((1..8) | ForEach-Object { $chars[(Get-Random -Maximum $chars.Length)] })
+            $p = -join ((1..8) | ForEach-Object { $chars[$bytes[$_] % $chars.Length] })
           }
           # VNC Classic يقبل 8 أحرف كحد أقصى
-          if ($p.Length -gt 8) { $p = $p.Substring(0,8) }
-          "vnc_pass=$p" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-          Write-Host "كلمة المرور جاهزة (ستظهر في الملخص)."
+          if ($p.Length -gt 8) { $p = $p.Substring(0, 8) }
+          "vnc_pass=$p" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Host "كلمة مرور VNC جاهزة (8 أحرف)."
 
+      # ---------------------------------------------------------------
+      # 2) إنشاء مستخدم + Auto-Logon
+      #    بدونه قد ترى شاشة القفل فقط بدل سطح المكتب
+      # ---------------------------------------------------------------
+      - name: "Create desktop user with auto-logon"
+        shell: pwsh
+        env:
+          DUSER: ${{ inputs.desktop_user }}
+          DPASS: ${{ steps.pass.outputs.vnc_pass }}Pass1!
+        run: |
+          $sec = ConvertTo-SecureString $env:DPASS -AsPlainText -Force
+          if (-not (Get-LocalUser -Name $env:DUSER -ErrorAction SilentlyContinue)) {
+            New-LocalUser -Name $env:DUSER -Password $sec -FullName $env:DUSER `
+                          -Description "Browser desktop session" -PasswordNeverExpires | Out-Null
+          } else { Set-LocalUser -Name $env:DUSER -Password $sec }
+          Enable-LocalUser -Name $env:DUSER
+          Add-LocalGroupMember -Group "Administrators" -Member $env:DUSER -ErrorAction SilentlyContinue
+
+          $wl = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
+          Set-ItemProperty -Path $wl -Name 'AutoAdminLogon'    -Value '1'       -Type String
+          Set-ItemProperty -Path $wl -Name 'DefaultUserName'   -Value $env:DUSER -Type String
+          Set-ItemProperty -Path $wl -Name 'DefaultPassword'   -Value $env:DPASS -Type String
+          Set-ItemProperty -Path $wl -Name 'DefaultDomainName' -Value '.'        -Type String
+          Write-Host "تم إنشاء المستخدم وتفعيل Auto-Logon."
+
+      # ---------------------------------------------------------------
+      # 3) تثبيت TightVNC (خادم VNC على 5900)
+      # ---------------------------------------------------------------
       - name: "Install TightVNC"
         shell: pwsh
         run: |
@@ -56,74 +109,211 @@ jobs:
             "SET_USECONTROLAUTHENTICATION=1", `
             "VALUE_OF_USECONTROLAUTHENTICATION=$pass", `
             "SET_CONTROLAUTHALWAYS=1", `
-            "VALUE_OF_CONTROLAUTHALWAYS=$pass", `
-            "SET_USECONTROLAUTHENTICATIONVIEWONLY=0", `
-            "VALUE_USECONTROLAUTHENTICATIONVIEWONLY=" `
+            "VALUE_OF_CONTROLAUTHALWAYS=$pass" `
             -Wait
           Write-Host "تم تثبيت TightVNC."
 
-      - name: "Allow VNC through firewall"
+      - name: "Start TightVNC service and open port 5900"
         shell: pwsh
         run: |
           New-NetFirewallRule -DisplayName "VNC 5900" -Direction Inbound -Protocol TCP `
-                              -LocalPort 5900 -Action Allow -Profile Any | Out-Null
+                              -LocalPort 5900 -Action Allow -Profile Any -ErrorAction SilentlyContinue | Out-Null
           Start-Service -Name tvnserver -ErrorAction SilentlyContinue
-          Write-Host "خادم VNC يعمل على المنفذ 5900."
+          Start-Sleep -Seconds 5
+          $listening = Get-NetTCPConnection -LocalPort 5900 -State Listen -ErrorAction SilentlyContinue
+          if ($listening) { Write-Host "✅ TightVNC يستمع على 5900" }
+          else { Write-Host "⚠️ 5900 غير مستمع — سأعيد تشغيل الخدمة"; Restart-Service tvnserver -Force -ErrorAction SilentlyContinue; Start-Sleep 5 }
+          # 5800 (Java applet) لا نحتاجه ولا نفتح له جدار الحماية
 
+      # ---------------------------------------------------------------
+      # 4) websockify — الجسر بين WebSocket و VNC
+      # ---------------------------------------------------------------
+      - name: "Install websockify"
+        shell: pwsh
+        run: |
+          python --version
+          python -m pip install --quiet --upgrade pip
+          python -m pip install --quiet websockify
+          python -c "import websockify; print('✅ websockify جاهز')"
+
+      # ---------------------------------------------------------------
+      # 5) noVNC — عميل HTML5
+      # ---------------------------------------------------------------
+      - name: "Download noVNC"
+        shell: pwsh
+        run: |
+          $url = "https://github.com/novnc/noVNC/archive/refs/tags/v$env:NOVNC_VERSION.zip"
+          Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP\novnc.zip"
+          Expand-Archive "$env:RUNNER_TEMP\novnc.zip" "$env:RUNNER_TEMP\novnc" -Force
+          $web = "$env:RUNNER_TEMP\novnc\noVNC-$env:NOVNC_VERSION"
+          if (-not (Test-Path "$web\vnc.html")) { throw "لم يُعثر على vnc.html داخل noVNC" }
+          "novnc_web=$web" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Host "✅ noVNC جاهز في: $web"
+        id: novnc
+
+      - name: "Start websockify (6080 -> 5900) serving noVNC"
+        shell: pwsh
+        run: |
+          $web = "${{ steps.novnc.outputs.novnc_web }}"
+          New-NetFirewallRule -DisplayName "noVNC 6080" -Direction Inbound -Protocol TCP `
+                              -LocalPort 6080 -Action Allow -Profile Any -ErrorAction SilentlyContinue | Out-Null
+          Start-Process -FilePath "python" `
+                        -ArgumentList "-m","websockify","--web=$web","6080","localhost:5900" `
+                        -RedirectStandardOutput "$env:RUNNER_TEMP\ws.out" `
+                        -RedirectStandardError  "$env:RUNNER_TEMP\ws.err" `
+                        -WindowStyle Hidden
+          Start-Sleep -Seconds 6
+          $ok = $false
+          for ($i = 0; $i -lt 6; $i++) {
+            try {
+              $r = Invoke-WebRequest "http://localhost:6080/vnc.html" -UseBasicParsing -TimeoutSec 8
+              if ($r.StatusCode -eq 200 -and $r.Content -match 'noVNC') { $ok = $true; break }
+            } catch { Start-Sleep -Seconds 3 }
+          }
+          if (-not $ok) {
+            Write-Host "--- ws.err ---"; Get-Content "$env:RUNNER_TEMP\ws.err" -ErrorAction SilentlyContinue | Select-Object -Last 25
+            throw "websockify لم يخدم صفحة noVNC على 6080."
+          }
+          Write-Host "✅ noVNC متاح محلياً على http://localhost:6080/vnc.html"
+
+      # ---------------------------------------------------------------
+      # 6) cloudflared — النفق العام (HTTP/2 وليس QUIC)
+      # ---------------------------------------------------------------
       - name: "Install cloudflared"
         shell: pwsh
         run: |
           Invoke-WebRequest `
             -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" `
             -OutFile "$env:RUNNER_TEMP\cloudflared.exe"
+          & "$env:RUNNER_TEMP\cloudflared.exe" --version
 
-      - name: "Start tunnel to VNC web interface"
+      - name: "Start Cloudflare quick tunnel (HTTP/2 -> 6080)"
         shell: pwsh
         run: |
+          # ⚠️ --url إلزامي: بدونه يرفض cloudflared ويعتبر الوسيط اسم نفق
           Start-Process -FilePath "$env:RUNNER_TEMP\cloudflared.exe" `
-                        -ArgumentList "tunnel","--no-autoupdate","http","localhost:5800" `
+                        -ArgumentList "tunnel","--no-autoupdate","--protocol","http2", `
+                                      "--url","http://localhost:6080" `
                         -RedirectStandardError "$env:RUNNER_TEMP\cf.log" `
+                        -RedirectStandardOutput "$env:RUNNER_TEMP\cf.out" `
                         -WindowStyle Hidden
-          Start-Sleep -Seconds 12
-          Write-Host "النفق يعمل."
+          Start-Sleep -Seconds 10
+          Write-Host "النفق قيد التشغيل."
 
-      - name: "Show access link"
+      # ---------------------------------------------------------------
+      # 7) استخراج الرابط + التحقق الفعلي من عمله
+      # ---------------------------------------------------------------
+      - name: "Extract and VERIFY public link"
+        id: link
         shell: pwsh
         run: |
           $url = $null
-          for ($i = 0; $i -lt 15 -and -not $url; $i++) {
+          for ($i = 0; $i -lt 20 -and -not $url; $i++) {
             $m = Select-String -Path "$env:RUNNER_TEMP\cf.log" `
                  -Pattern 'https://[a-z0-9\-]+\.trycloudflare\.com' -ErrorAction SilentlyContinue |
                  Select-Object -First 1
-            if ($m) { $url = $m.Matches[0].Value } else { Start-Sleep -Seconds 5 }
+            if ($m) { $url = $m.Matches[0].Value } else { Start-Sleep -Seconds 4 }
           }
           if (-not $url) {
-            Get-Content "$env:RUNNER_TEMP\cf.log" -ErrorAction SilentlyContinue | Select-Object -Last 40
-            throw "تعذّر استخراج رابط النفق."
+            Write-Host "===== cf.log (آخر 40 سطراً) ====="
+            Get-Content "$env:RUNNER_TEMP\cf.log" -Tail 40 -ErrorAction SilentlyContinue
+            Write-Host "===== هل العملية حيّة؟ ====="
+            Get-Process cloudflared -ErrorAction SilentlyContinue | Format-Table Id,ProcessName
+            throw "تعذّر استخراج رابط النفق من cloudflared."
+          }
+
+          # ⭐ التحقق الفعلي: هل الصفحة تصل فعلاً عبر الإنترنت؟
+          $full = "$url/vnc.html?autoconnect=true&resize=scale&reconnect=true&show_dot=true&path=websockify"
+          $verified = $false
+          for ($i = 0; $i -lt 6; $i++) {
+            try {
+              $r = Invoke-WebRequest $full -UseBasicParsing -TimeoutSec 15
+              if ($r.StatusCode -eq 200 -and $r.Content -match 'noVNC') { $verified = $true; break }
+            } catch { Start-Sleep -Seconds 5 }
+          }
+          if (-not $verified) {
+            Write-Host "⚠️  الرابط استُخرج لكن الصفحة لم تستجب — التفاصيل:"
+            try { (Invoke-WebRequest $full -UseBasicParsing -TimeoutSec 15).StatusCode } catch { $_.Exception.Message }
+          }
+
+          "tunnel_url=$url"      | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "full_url=$full"       | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "verified=$verified"   | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Host "============================================"
+          Write-Host " الرابط : $full"
+          Write-Host " مُتحقَّق منه: $verified"
+          Write-Host "============================================"
+
+      # ---------------------------------------------------------------
+      # 8) عرض الرابط في ملخص الـ Run
+      # ---------------------------------------------------------------
+      - name: "Show access link"
+        shell: pwsh
+        run: |
+          $verifiedNote = if ("${{ steps.link.outputs.verified }}" -eq "True") {
+            "✅ **مُتحقَّق منه** — الصفحة استجابت بـ HTTP 200"
+          } else {
+            "⚠️ لم يتم التحقق تلقائياً — جرّب الرابط، وإن فشل راجع سجل الـ Run"
           }
 
           @"
           ## 🖥️ سطح مكتب Windows جاهز في متصفحك
 
-          | الحقل | القيمة |
-          |---|---|
-          | **الرابط** | $url |
-          | **كلمة المرور** | ``${{ steps.pass.outputs.vnc_pass }}`` |
+          $verifiedNote
+
+          ### 🔗 الرابط
+          ${{ steps.link.outputs.full_url }}
+
+          ### 🔑 كلمة المرور
+          ``${{ steps.pass.outputs.vnc_pass }}``
 
           ### طريقة الاستخدام
-          1. افتح الرابط أعلاه في أي متصفح (Chrome / Edge).
-          2. أدخل كلمة المرور.
-          3. ستظهر شاشة Windows كاملة ويمكنك التحكم بها بالماوس والكيبورد.
+          1. افتح الرابط أعلاه في أي متصفح حديث (Chrome / Edge / Firefox / Safari).
+          2. إن طُلبت كلمة مرور، أدخل القيمة أعلاه.
+          3. ستظهر شاشة Windows كاملة — تحكّم بها بالماوس والكيبورد.
+          4. إن ظهرت شاشة القفل: اسم المستخدم ``${{ inputs.desktop_user }}``
+             وكلمة المرور ``${{ steps.pass.outputs.vnc_pass }}Pass1!``
+
+          ### 🛠️ أزرار مفيدة في noVNC
+          اللسان الجانبي الأيسر يفتح لوحة فيها:
+          - **Fullscreen** لملء الشاشة
+          - **Clipboard** للنسخ واللصق بين جهازك والجهاز البعيد
+          - **Settings** لتغيير الجودة إن كان الاتصال بطيئاً
 
           > ⏱️ الجلسة تنتهي تلقائياً بعد ${{ inputs.session_minutes }} دقيقة.
-          > 🔒 لا تشارك الرابط مع أحد — من يملكه يستطيع الدخول.
+          > 🔒 لا تشارك الرابط — من يملكه يستطيع الدخول.
+          > 💾 احفظ ملفاتك قبل النهاية: الجهاز يُحذف نهائياً.
           "@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
-          Write-Host "URL: $url"
 
+      # ---------------------------------------------------------------
+      # 9) إبقاء الجلسة حيّة مع مراقبة النفق وإعادته إن سقط
+      # ---------------------------------------------------------------
       - name: "Keep session alive"
         shell: pwsh
         run: |
           $minutes  = [int]"${{ inputs.session_minutes }}"
           $deadline = (Get-Date).AddMinutes($minutes)
-          while ((Get-Date) -lt $deadline) { Start-Sleep -Seconds 30 }
-          Write-Host "انتهت الجلسة."
+          $full     = "${{ steps.link.outputs.full_url }}"
+          Write-Host "الجلسة تنتهي في: $deadline"
+
+          while ((Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 45
+            try {
+              $r = Invoke-WebRequest $full -UseBasicParsing -TimeoutSec 15
+              if ($r.StatusCode -ne 200) { throw "status $($r.StatusCode)" }
+            } catch {
+              Write-Host "⚠️ النفق غير مستجيب — إعادة التشغيل..."
+              Get-Process cloudflared -ErrorAction SilentlyContinue | Stop-Process -Force
+              Start-Sleep -Seconds 3
+              Start-Process -FilePath "$env:RUNNER_TEMP\cloudflared.exe" `
+                            -ArgumentList "tunnel","--no-autoupdate","--protocol","http2", `
+                                          "--url","http://localhost:6080" `
+                            -RedirectStandardError "$env:RUNNER_TEMP\cf.log" `
+                            -WindowStyle Hidden
+              Start-Sleep -Seconds 15
+              Write-Host "⚠️ تحذير: الرابط تغيّر على الأرجح. انسخ الجديد من cf.log في سجل هذه الخطوة."
+              Get-Content "$env:RUNNER_TEMP\cf.log" -ErrorAction SilentlyContinue |
+                Select-String 'trycloudflare\.com' | Select-Object -Last 1
+            }
+          }
+          Write-Host "انتهت مدة الجلسة."
