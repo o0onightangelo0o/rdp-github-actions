@@ -75,10 +75,13 @@ jobs:
       # ---------------------------------------------------------------
       - name: "Enable Remote Desktop"
         shell: pwsh
+        env:
+          # ⚠️ تُمرَّر عبر env وليس بإدراج نصي داخل الأمر،
+          #    لأن الإدراج النصي يطبع كلمة المرور في ترويسة "Run ..." بالسجل.
+          RDP_USER: ${{ steps.creds.outputs.rdp_user }}
+          RDP_PASS: ${{ steps.creds.outputs.rdp_pass }}
         run: |
-          ./scripts/enable-rdp.ps1 -Username "${{ steps.creds.outputs.rdp_user }}" `
-                                   -Password "${{ steps.creds.outputs.rdp_pass }}" `
-                                   -Port ${{ inputs.rdp_port }}
+          ./scripts/enable-rdp.ps1 -Username $env:RDP_USER -Password $env:RDP_PASS -Port ${{ inputs.rdp_port }}
 
       # ---------------------------------------------------------------
       # 4) تحميل ngrok وتشغيل النفق
@@ -183,6 +186,17 @@ jobs:
           Write-Host " Host : $host_"
           Write-Host " Port : $port"
           Write-Host " User : $user"
+          if ($env:SHOW_PASS -eq 'true') {
+            # تُطبع في السجل أيضاً، لا في Summary وحده — لأن Summary يُحمَّل
+            # بـ JavaScript وقد لا يظهر لبعض المستخدمين.
+            Write-Host " Pass : $env:RDP_PASS"
+          } else {
+            Write-Host " Pass : (مخفية — فعّل show_password_in_summary)"
+          }
+          Write-Host "=========================================="
+          Write-Host ""
+          Write-Host " للاتصال من Windows:  Win+R  ثم  mstsc"
+          Write-Host " ثم في حقل Computer:   $host_`:$port"
           Write-Host "=========================================="
 
       # ---------------------------------------------------------------

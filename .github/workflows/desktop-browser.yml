@@ -100,10 +100,13 @@ jobs:
       # ---------------------------------------------------------------
       - name: "Install TightVNC"
         shell: pwsh
+        env:
+          # عبر env لا بإدراج نصي، لئلا تُطبع كلمة المرور في ترويسة "Run ..."
+          VNC_PASS: ${{ steps.pass.outputs.vnc_pass }}
         run: |
           $installer = "https://www.tightvnc.com/download/2.8.84/tightvnc-2.8.84-gpl-setup-64bit.msi"
           Invoke-WebRequest -Uri $installer -OutFile "$env:RUNNER_TEMP\tightvnc.msi"
-          $pass = "${{ steps.pass.outputs.vnc_pass }}"
+          $pass = $env:VNC_PASS
           Start-Process msiexec.exe -ArgumentList "/i","$env:RUNNER_TEMP\tightvnc.msi","/quiet","/norestart", `
             "ADDLOCAL=Server,Viewer", `
             "SET_USECONTROLAUTHENTICATION=1", `
