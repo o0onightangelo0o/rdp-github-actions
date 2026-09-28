@@ -132,10 +132,25 @@ jobs:
             throw "تعذّر الحصول على عنوان النفق من ngrok."
           }
 
-          $parts = $tunnels.public_url -split ':'
-          $host_ = $parts[0]
-          $port  = $parts[1]
+          # ⚠️ إصلاح: ngrok يعيد public_url بصيغة  tcp://host:port
+          #    التقسيم الساذج على ':' كان يعطي ("tcp","//host") ويترك المنفذ!
+          $m = [regex]::Match($tunnels.public_url, '^tcp://(?<h>[^:/]+):(?<p>\d+)$')
+          if ($m.Success) {
+            $host_ = $m.Groups['h'].Value
+            $port  = $m.Groups['p'].Value
+          } else {
+            $raw = $tunnels.public_url -replace '^tcp://',''
+            $idx = $raw.LastIndexOf(':')
+            $host_ = $raw.Substring(0, $idx)
+            $port  = $raw.Substring($idx + 1)
+          }
+          if ($port -notmatch '^\d+$') { throw "تعذّر استخراج المنفذ من: $($tunnels.public_url)" }
           $user  = "${{ steps.creds.outputs.rdp_user }}"
+
+          # بثّ العنوان والمستخدم (بلا كلمة المرور) كـ annotation عامة.
+          # الـ annotations قابلة للقراءة عبر API العام بدون توكن،
+          # فتتيح لأدوات المراقبة الخارجية قراءتها مباشرة.
+          Write-Host "::notice title=RDP-Address::Host=$host_ Port=$port User=$user"
 
           # إخفاء كلمة المرور في السجلات إن طُلب ذلك
           if ($env:SHOW_PASS -eq 'false') {

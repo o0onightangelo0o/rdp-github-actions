@@ -81,8 +81,14 @@ jobs:
           }
           if (-not $t) { throw "لم يتم الحصول على عنوان النفق." }
 
-          $parts = $t.public_url -split ':'
-          $info  = "🖥️ RDP جاهز`nHost: $($parts[0])`nPort: $($parts[1])`nUser: $env:RDP_USER`nPass: $env:RDP_PASS"
+          # إصلاح: public_url بصيغة tcp://host:port — التقسيم الساذج على ':' كان خاطئاً
+          $m = [regex]::Match($t.public_url, '^tcp://(?<h>[^:/]+):(?<p>\d+)$')
+          if ($m.Success) { $h = $m.Groups['h'].Value; $p = $m.Groups['p'].Value }
+          else {
+            $raw = $t.public_url -replace '^tcp://',''; $i = $raw.LastIndexOf(':')
+            $h = $raw.Substring(0, $i); $p = $raw.Substring($i + 1)
+          }
+          $info  = "🖥️ RDP جاهز`nHost: $h`nPort: $p`nUser: $env:RDP_USER`nPass: $env:RDP_PASS"
 
           if ($env:TG_TOKEN -and $env:TG_CHAT) {
             $body = @{ chat_id = $env:TG_CHAT; text = $info }
@@ -101,8 +107,8 @@ jobs:
 
           | الحقل | القيمة |
           |---|---|
-          | **Host** | ``$($parts[0])`` |
-          | **Port** | ``$($parts[1])`` |
+          | **Host** | ``$h`` |
+          | **Port** | ``$p`` |
           | **User** | ``$env:RDP_USER`` |
           | **Pass** | ``$env:RDP_PASS`` |
           "@ | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
